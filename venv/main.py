@@ -1,6 +1,6 @@
 import os
 import json
-from datetime import datetime,timezone,timedelta
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
 from openai import OpenAI
@@ -14,7 +14,7 @@ load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 MODEL = "gpt-4o-mini"
-MAX_HISTORY = 10  # excluding the system message
+MAX_HISTORY = 10  # number of recent messages to keep (excluding system)
 TASKS_FILE = "tasks.json"
 
 SYSTEM_PROMPT = """
@@ -33,38 +33,36 @@ messages: List[Dict[str, Any]] = [
 ]
 
 # ----------------------------
-# Tool schema (argument validation)
+# Tool schemas (argument validation)
 # ----------------------------
 class CreateTaskArgs(BaseModel):
     title: str = Field(..., min_length=1, description="Short title for the task")
-    due_date: Optional[str] = Field(
-        None,
-        description="Due date in YYYY-MM-DD (optional)"
-    )
+    due_date: Optional[str] = Field(None, description="Due date in YYYY-MM-DD (optional)")
     notes: Optional[str] = Field(None, description="Extra notes (optional)")
 
 class ListTasksArgs(BaseModel):
     status: str = Field("open", description="one of: open, done, all")
 
-
 # ----------------------------
-# Tool implementation (your code runs this)
+# Task storage helpers
 # ----------------------------
 def _load_tasks() -> List[dict]:
     if not os.path.exists(TASKS_FILE):
         return []
     with open(TASKS_FILE, "r", encoding="utf-8") as f:
         try:
-            return json.load(f)
+            data = json.load(f)
+            return data if isinstance(data, list) else []
         except json.JSONDecodeError:
             return []
-
 
 def _save_tasks(tasks: List[dict]) -> None:
     with open(TASKS_FILE, "w", encoding="utf-8") as f:
         json.dump(tasks, f, indent=2, ensure_ascii=False)
 
-
+# ----------------------------
+# Tools (your code executes these)
+# ----------------------------
 def create_task(title: str, due_date: Optional[str] = None, notes: Optional[str] = None) -> dict:
     # Basic due_date validation (optional)
     if due_date is not None:
@@ -85,7 +83,6 @@ def create_task(title: str, due_date: Optional[str] = None, notes: Optional[str]
     tasks.append(task)
     _save_tasks(tasks)
     return {"ok": True, "task": task}
-
 
 def list_tasks(status: str = "open") -> dict:
     tasks = _load_tasks()
@@ -111,9 +108,8 @@ def list_tasks(status: str = "open") -> dict:
 
     return {"ok": True, "count": len(filtered_sorted), "tasks": filtered_sorted}
 
-
 # ----------------------------
-# Tool definitions for the model
+# Tool definitions (for the model)
 # ----------------------------
 tools = [
     {
@@ -131,34 +127,37 @@ tools = [
                 "required": ["title"],
                 "additionalProperties": False,
             },
-            
         },
     },
     {
         "type": "function",
         "function": {
             "name": "list_tasks",
-            "description": "List tasks with optional filtering by status.",
+            "description": "List tasks stored locally (optionally filtered by status).",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "status": {"type": "string", "description": "Status to filter tasks by (open, done, all)"},
+                    "status": {"type": "string", "description": "Filter by status: open, done, all"},
                 },
                 "required": [],
                 "additionalProperties": False,
             },
-            
         },
-    }
+    },
 ]
 
-
+# ----------------------------
+# Helpers
+# ----------------------------
 def trim_messages(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # Keep system + last MAX_HISTORY messages
     if len(msgs) <= MAX_HISTORY + 1:
         return msgs
     return [msgs[0]] + msgs[-MAX_HISTORY:]
 
-
+# ----------------------------
+# Main loop
+# ----------------------------
 print("Secure AI Assistant + Tasks (type 'exit' to quit)\n")
 print(f"Tasks will be saved to: {TASKS_FILE}\n")
 
@@ -177,61 +176,64 @@ while True:
         model=MODEL,
         messages=messages,
         tools=tools,
+        tool_choice="auto",
     )
 
-assistant_msg = response.choices[0].message
-messages.append(assistant_msg)
+    assistant_msg = response.choices[0].message
+    messages.append(assistant_msg)
 
-# 2) If tool calls exist, execute them and send results back
-tool_calls = getattr(assistant_msg, "tool_calls", None) or []
+    # 2) If tool calls exist, execute them and send results back
+    tool_calls = getattr(assistant_msg, "tool_calls", None) or []
 
-if tool_calls:
-    for tool_call in tool_calls:
-        tool_name = tool_call.function.name
-        raw_args = tool_call.function.arguments
+    if tool_calls:
+        for tool_call in tool_calls:
+            tool_name = tool_call.function.name
+            raw_args = tool_call.function.arguments
 
-        if tool_name == "create_task":
-            try:
-                args = CreateTaskArgs.model_validate_json(raw_args)
-                result = create_task(title=args.title, due_date=args.due_date, notes=args.notes)
-            except ValidationError as e:
-                result = {"ok": False, "error": "Invalid tool arguments", "details": e.errors()}
-            except Exception as e:
-                result = {"ok": False, "error": f"Tool execution failed: {str(e)}"}
+            if tool_name == "create_task":
+                try:
+                    args = CreateTaskArgs.model_validate_json(raw_args)
+                    result = create_task(title=args.title, due_date=args.due_date, notes=args.notes)
+                except ValidationError as e:
+                    result = {"ok": False, "error": "Invalid tool arguments", "details": e.errors()}
+                except Exception as e:
+                    result = {"ok": False, "error": f"Tool execution failed: {str(e)}"}
 
-        elif tool_name == "list_tasks":
-            try:
-                args = ListTasksArgs.model_validate_json(raw_args) if raw_args else ListTasksArgs()
-                result = list_tasks(status=args.status)
-            except ValidationError as e:
-                result = {"ok": False, "error": "Invalid tool arguments", "details": e.errors()}
-            except Exception as e:
-                result = {"ok": False, "error": f"Tool execution failed: {str(e)}"}
+            elif tool_name == "list_tasks":
+                try:
+                    args = ListTasksArgs.model_validate_json(raw_args) if raw_args else ListTasksArgs()
+                    result = list_tasks(status=args.status)
+                except ValidationError as e:
+                    result = {"ok": False, "error": "Invalid tool arguments", "details": e.errors()}
+                except Exception as e:
+                    result = {"ok": False, "error": f"Tool execution failed: {str(e)}"}
 
-        else:
-            result = {"ok": False, "error": f"Unknown tool: {tool_name}"}
+            else:
+                result = {"ok": False, "error": f"Unknown tool: {tool_name}"}
 
-        # Provide tool output back to the model (IMPORTANT)
-        messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": json.dumps(result),
-            }
+            # Provide tool output back to the model (IMPORTANT)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(result),
+                }
+            )
+
+        # 3) Ask the model again so it can respond to the user using tool results
+        response2 = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
         )
+        final_reply = response2.choices[0].message.content
+        print("Assistant:", final_reply)
 
-    # 3) Ask the model again so it can respond to the user using tool results
-    response2 = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        tools=tools,
-    )
-    final_reply = response2.choices[0].message.content
-    print("Assistant:", final_reply)
-    messages.append({"role": "assistant", "content": final_reply})
-    messages = trim_messages(messages)
+        messages.append({"role": "assistant", "content": final_reply})
+        messages = trim_messages(messages)
 
-else:
-    # Normal reply, no tools used
-    print("Assistant:", assistant_msg.content)
-    messages = trim_messages(messages)
+    else:
+        # Normal reply, no tools used
+        print("Assistant:", assistant_msg.content)
+        messages = trim_messages(messages)
