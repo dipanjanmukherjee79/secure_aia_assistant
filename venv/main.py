@@ -64,14 +64,31 @@ def _save_tasks(tasks: List[dict]) -> None:
 # Tools (your code executes these)
 # ----------------------------
 def create_task(title: str, due_date: Optional[str] = None, notes: Optional[str] = None) -> dict:
-    # Basic due_date validation (optional)
     if due_date is not None:
         try:
             datetime.strptime(due_date, "%Y-%m-%d")
         except ValueError:
-            return {"ok": False, "error": "due_date must be in YYYY-MM-DD format (e.g., 2026-02-25)"}
+            return {
+                "ok": False,
+                "error": "due_date must be in YYYY-MM-DD format (e.g., 2026-02-25)"
+            }
 
     tasks = _load_tasks()
+
+    normalized_title = title.strip().lower()
+
+    # ✅ Duplicate detection
+    for task in tasks:
+        existing_title = task.get("title", "").strip().lower()
+        existing_due = task.get("due_date")
+
+        if existing_title == normalized_title and existing_due == due_date:
+            return {
+                "ok": False,
+                "error": "Duplicate task with same title and due date already exists.",
+                "existing_task": task
+            }
+
     task = {
         "id": f"tsk_{len(tasks) + 1}",
         "title": title.strip(),
@@ -80,8 +97,10 @@ def create_task(title: str, due_date: Optional[str] = None, notes: Optional[str]
         "created_at": datetime.now(timezone.utc).isoformat(),
         "done": False,
     }
+
     tasks.append(task)
     _save_tasks(tasks)
+
     return {"ok": True, "task": task}
 
 def list_tasks(status: str = "open") -> dict:
@@ -107,6 +126,29 @@ def list_tasks(status: str = "open") -> dict:
     filtered_sorted = sorted(filtered, key=sort_key)
 
     return {"ok": True, "count": len(filtered_sorted), "tasks": filtered_sorted}
+
+def choose_tool_for_input(text: str) -> Optional[str]:
+    t = (text or "").lower().strip()
+
+    create_triggers = [
+        "add task", "create task", "new task", "remind me", "todo", "to-do", "task:"
+    ]
+    list_triggers = [
+        "list tasks", "show tasks", "my tasks", "check tasks", "what are my tasks"
+    ]
+
+    if any(k in t for k in list_triggers):
+        return "list_tasks"
+    if any(k in t for k in create_triggers):
+        return "create_task"
+
+    # also catch common natural phrasing
+    if t.startswith("add ") or t.startswith("remind ") or t.startswith("create "):
+        # still ambiguous, but often a task
+        if "task" in t or "remind" in t:
+            return "create_task"
+
+    return None
 
 # ----------------------------
 # Tool definitions (for the model)
@@ -172,11 +214,13 @@ while True:
     messages = trim_messages(messages)
 
     # 1) Ask the model (it may decide to call a tool)
+
+    forced_tool = choose_tool_for_input(user_input)
     response = client.chat.completions.create(
         model=MODEL,
         messages=messages,
         tools=tools,
-        tool_choice="auto",
+        tool_choice={"type": "function", "function": {"name": forced_tool}} if forced_tool else "auto",
     )
 
     assistant_msg = response.choices[0].message
@@ -184,6 +228,7 @@ while True:
 
     # 2) If tool calls exist, execute them and send results back
     tool_calls = getattr(assistant_msg, "tool_calls", None) or []
+    print("DEBUG tool_calls:", tool_calls)
 
     if tool_calls:
         for tool_call in tool_calls:
